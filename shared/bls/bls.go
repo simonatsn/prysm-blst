@@ -4,22 +4,19 @@
 package bls
 
 import (
+	"crypto/rand"
 	"fmt"
 
 	"github.com/dgraph-io/ristretto"
-	bls12 "github.com/herumi/bls-eth-go-binary/bls"
 	"github.com/pkg/errors"
 	"github.com/prysmaticlabs/prysm/shared/featureconfig"
 	"github.com/prysmaticlabs/prysm/shared/params"
+	blst "github.com/supranational/blst/bindings/go"
 )
 
+var dst = []byte("BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_")
+
 func init() {
-	if err := bls12.Init(bls12.BLS12_381); err != nil {
-		panic(err)
-	}
-	if err := bls12.SetETHmode(bls12.EthModeDraft07); err != nil {
-		panic(err)
-	}
 }
 
 // DomainByteLength length of domain byte array.
@@ -35,26 +32,38 @@ var pubkeyCache, _ = ristretto.NewCache(&ristretto.Config{
 // CurveOrder for the BLS12-381 curve.
 const CurveOrder = "52435875175126190479447740508185965837690552500527637822603658699938581184513"
 
+// Internal types for min-pk
+type blstSecretKey = blst.SecretKey
+type blstPublicKey = blst.P1Affine
+type blstSignature = blst.P2Affine
+type blstAggregateSignature = blst.P2Aggregate
+type blstAggregatePublicKey = blst.P1Aggregate
+
 // Signature used in the BLS signature scheme.
 type Signature struct {
-	s *bls12.Sign
+	s *blstSignature
 }
 
 // PublicKey used in the BLS signature scheme.
 type PublicKey struct {
-	p *bls12.PublicKey
+	p *blstPublicKey
 }
 
 // SecretKey used in the BLS signature scheme.
 type SecretKey struct {
-	p *bls12.SecretKey
+	p *blstSecretKey
 }
 
 // RandKey creates a new private key using a random method provided as an io.Reader.
 func RandKey() *SecretKey {
-	secKey := &bls12.SecretKey{}
-	secKey.SetByCSPRNG()
-	return &SecretKey{secKey}
+	// TODO: use CSPRNG?
+	// Generate 32 bytes of randomness
+	var ikm [32]byte
+	_, err := rand.Read(ikm[:])
+	if err != nil {
+		return nil
+	}
+	return &SecretKey{blst.KeyGen(ikm[:])}
 }
 
 // SecretKeyFromBytes creates a BLS private key from a BigEndian byte slice.
@@ -62,12 +71,13 @@ func SecretKeyFromBytes(privKey []byte) (*SecretKey, error) {
 	if len(privKey) != params.BeaconConfig().BLSSecretKeyLength {
 		return nil, fmt.Errorf("secret key must be %d bytes", params.BeaconConfig().BLSSecretKeyLength)
 	}
-	secKey := &bls12.SecretKey{}
-	err := secKey.Deserialize(privKey)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not unmarshal bytes into secret key")
+
+	secKey := new(blstSecretKey).Deserialize(privKey)
+	if secKey == nil {
+		return nil, errors.New("could not unmarshal bytes into secret key")
 	}
-	return &SecretKey{p: secKey}, err
+
+	return &SecretKey{p: secKey}, nil
 }
 
 // PublicKeyFromBytes creates a BLS public key from a  BigEndian byte slice.
@@ -81,15 +91,15 @@ func PublicKeyFromBytes(pubKey []byte) (*PublicKey, error) {
 	if cv, ok := pubkeyCache.Get(string(pubKey)); ok {
 		return cv.(*PublicKey).Copy()
 	}
-	p := &bls12.PublicKey{}
-	err := p.Deserialize(pubKey)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not unmarshal bytes into public key")
+
+	p := new(blstPublicKey).Uncompress(pubKey)
+	if p == nil {
+		return nil, errors.New("could not unmarshal bytes into public key")
 	}
 	pubKeyObj := &PublicKey{p: p}
 	copiedKey, err := pubKeyObj.Copy()
 	if err != nil {
-		return nil, errors.Wrap(err, "could not copy public key")
+		return nil, errors.New("could not copy public key")
 	}
 	pubkeyCache.Set(string(pubKey), copiedKey, 48)
 	return pubKeyObj, nil
@@ -103,17 +113,16 @@ func SignatureFromBytes(sig []byte) (*Signature, error) {
 	if len(sig) != params.BeaconConfig().BLSSignatureLength {
 		return nil, fmt.Errorf("signature must be %d bytes", params.BeaconConfig().BLSSignatureLength)
 	}
-	signature := &bls12.Sign{}
-	err := signature.Deserialize(sig)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not unmarshal bytes into signature")
+	signature := new(blstSignature).Uncompress(sig)
+	if signature == nil {
+		return nil, errors.New("could not unmarshal bytes into signature")
 	}
 	return &Signature{s: signature}, nil
 }
 
 // PublicKey obtains the public key corresponding to the BLS secret key.
 func (s *SecretKey) PublicKey() *PublicKey {
-	return &PublicKey{p: s.p.GetPublicKey()}
+	return &PublicKey{p: new(blstPublicKey).From(s.p)}
 }
 
 // Sign a message using a secret key - in a beacon/validator client.
@@ -128,7 +137,8 @@ func (s *SecretKey) Sign(msg []byte) *Signature {
 	if featureconfig.Get().SkipBLSVerify {
 		return &Signature{}
 	}
-	signature := s.p.SignByte(msg)
+
+	signature := new(blstSignature).Sign(s.p, msg, dst)
 	return &Signature{s: signature}
 }
 
@@ -144,7 +154,7 @@ func (s *SecretKey) Marshal() []byte {
 
 // Marshal a public key into a LittleEndian byte slice.
 func (p *PublicKey) Marshal() []byte {
-	return p.p.Serialize()
+	return p.p.Compress()
 }
 
 // Copy the public key to a new pointer reference.
@@ -158,7 +168,12 @@ func (p *PublicKey) Aggregate(p2 *PublicKey) *PublicKey {
 	if featureconfig.Get().SkipBLSVerify {
 		return p
 	}
-	p.p.Add(p2.p)
+
+	agg := new(blstAggregatePublicKey)
+	agg.Add(p.p)
+	agg.Add(p2.p)
+	p.p = agg.ToAffine()
+
 	return p
 }
 
@@ -175,7 +190,7 @@ func (s *Signature) Verify(pubKey *PublicKey, msg []byte) bool {
 	if featureconfig.Get().SkipBLSVerify {
 		return true
 	}
-	return s.s.VerifyByte(pubKey.p, msg)
+	return s.s.Verify(pubKey.p, msg, dst)
 }
 
 // AggregateVerify verifies each public key against its respective message.
@@ -202,14 +217,15 @@ func (s *Signature) AggregateVerify(pubKeys []*PublicKey, msgs [][32]byte) bool 
 	if size != len(msgs) {
 		return false
 	}
-	msgSlices := make([]byte, 0, 32*len(msgs))
-	rawKeys := make([]bls12.PublicKey, 0, len(pubKeys))
+	msgSlices := make([][]byte, len(msgs))
+	rawKeys := make([]*blstPublicKey, len(msgs))
 	for i := 0; i < size; i++ {
-		msgSlices = append(msgSlices, msgs[i][:]...)
-		rawKeys = append(rawKeys, *pubKeys[i].p)
+		msgSlices[i] = msgs[i][:]
+		rawKeys[i] = pubKeys[i].p
 	}
 	// Use "NoCheck" because we do not care if the messages are unique or not.
-	return s.s.AggregateVerifyNoCheck(rawKeys, msgSlices)
+	//return s.s.AggregateVerifyNoCheck(rawKeys, msgSlices)
+	return s.s.AggregateVerify(rawKeys, msgSlices, dst)
 }
 
 // FastAggregateVerify verifies all the provided public keys with their aggregated signature.
@@ -229,17 +245,18 @@ func (s *Signature) FastAggregateVerify(pubKeys []*PublicKey, msg [32]byte) bool
 	if len(pubKeys) == 0 {
 		return false
 	}
-	rawKeys := make([]bls12.PublicKey, len(pubKeys))
+	rawKeys := make([]*blstPublicKey, len(pubKeys))
 	for i := 0; i < len(pubKeys); i++ {
-		rawKeys[i] = *pubKeys[i].p
+		rawKeys[i] = pubKeys[i].p
 	}
 
-	return s.s.FastAggregateVerify(rawKeys, msg[:])
+	return s.s.FastAggregateVerify(rawKeys, msg[:], dst)
 }
 
 // NewAggregateSignature creates a blank aggregate signature.
 func NewAggregateSignature() *Signature {
-	return &Signature{s: bls12.HashAndMapToSignature([]byte{'m', 'o', 'c', 'k'})}
+	sig := blst.HashToG2([]byte{'m', 'o', 'c', 'k'}, dst).ToAffine()
+	return &Signature{s: sig}
 }
 
 // AggregateSignatures converts a list of signatures into a single, aggregated sig.
@@ -251,12 +268,16 @@ func AggregateSignatures(sigs []*Signature) *Signature {
 		return sigs[0]
 	}
 
-	// Copy signature
-	signature := *sigs[0].s
-	for i := 1; i < len(sigs); i++ {
-		signature.Add(sigs[i].s)
+	rawSigs := make([]*blstSignature, len(sigs))
+	for i := 0; i < len(sigs); i++ {
+		rawSigs[i] = sigs[i].s
 	}
-	return &Signature{s: &signature}
+
+	signature := new(blstAggregateSignature).Aggregate(rawSigs)
+	if signature == nil {
+		return nil
+	}
+	return &Signature{s: signature.ToAffine()}
 }
 
 // Aggregate is an alias for AggregateSignatures, defined to conform to BLS specification.
@@ -280,5 +301,5 @@ func (s *Signature) Marshal() []byte {
 		return make([]byte, params.BeaconConfig().BLSSignatureLength)
 	}
 
-	return s.s.Serialize()
+	return s.s.Compress()
 }
