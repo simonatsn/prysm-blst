@@ -83,14 +83,6 @@ func VerifySigningRoot(obj interface{}, pub []byte, signature []byte, domain []b
 
 // VerifyBlockSigningRoot verifies the signing root of a block given it's public key, signature and domain.
 func VerifyBlockSigningRoot(blk *ethpb.BeaconBlock, pub []byte, signature []byte, domain []byte) error {
-	publicKey, err := bls.PublicKeyFromBytes(pub)
-	if err != nil {
-		return errors.Wrap(err, "could not convert bytes to public key")
-	}
-	sig, err := bls.SignatureFromBytes(signature)
-	if err != nil {
-		return errors.Wrap(err, "could not convert bytes to signature")
-	}
 	root, err := signingData(func() ([32]byte, error) {
 		// utilize custom block hashing function
 		return stateutil.BlockRoot(blk)
@@ -98,7 +90,7 @@ func VerifyBlockSigningRoot(blk *ethpb.BeaconBlock, pub []byte, signature []byte
 	if err != nil {
 		return errors.Wrap(err, "could not compute signing root")
 	}
-	if !sig.Verify(publicKey, root[:]) {
+	if !bls.VerifyCompressed(signature, pub, root[:]) {
 		return ErrSigFailedToVerify
 	}
 	return nil

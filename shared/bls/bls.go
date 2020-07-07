@@ -6,6 +6,8 @@ package bls
 import (
 	"crypto/rand"
 	"fmt"
+	"math"
+	"runtime"
 
 	"github.com/dgraph-io/ristretto"
 	"github.com/pkg/errors"
@@ -17,6 +19,11 @@ import (
 var dst = []byte("BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_")
 
 func init() {
+	maxProcs := int(math.Ceil(float64(runtime.GOMAXPROCS(0)) * 0.75))
+	if maxProcs <= 0 {
+		maxProcs = 1
+	}
+	blst.SetMaxProcs(maxProcs)
 }
 
 // DomainByteLength length of domain byte array.
@@ -191,6 +198,10 @@ func (s *Signature) Verify(pubKey *PublicKey, msg []byte) bool {
 		return true
 	}
 	return s.s.Verify(pubKey.p, msg, dst)
+}
+
+func VerifyCompressed(signature []byte, pub []byte, msg []byte) bool {
+	return new(blstSignature).VerifyCompressed(signature, pub, msg, dst)
 }
 
 // AggregateVerify verifies each public key against its respective message.
